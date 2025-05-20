@@ -22,7 +22,8 @@ def save_data(data):
         json.dump(data, f, indent=2)
 
 # ====== Userbot Setup ======
-client = TelegramClient(SESSION, API_ID, API_HASH)
+from telethon.sessions import StringSession
+client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 app = FastAPI()
 
 @app.get("/")
