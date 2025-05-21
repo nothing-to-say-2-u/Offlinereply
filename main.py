@@ -17,7 +17,7 @@ app = FastAPI()
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
 # Global state
-is_offline = True
+is_offline = False
 offline_message = "I'm currently offline. Will reply soon!"
 
 @app.on_event("startup")
