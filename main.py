@@ -1,9 +1,10 @@
 import os
 import asyncio
+import json # For potential future persistence, good to import
 from fastapi import FastAPI
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import User, Channel, Chat # Import necessary types for robust checks
+from telethon.tl.types import User, Channel, Chat
 
 # Load environment variables
 API_ID = int(os.getenv("API_ID"))
@@ -21,6 +22,17 @@ client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 is_offline = False
 offline_message = "I'm currently offline. Will reply soon!"
 
+# --- NEW: Dictionary to store custom commands ---
+# Format: {"trigger_phrase": "reply_message"}
+custom_commands = {}
+# For persistence, you might load this from a file at startup:
+# try:
+#     with open("custom_commands.json", "r") as f:
+#         custom_commands = json.load(f)
+# except (FileNotFoundError, json.JSONDecodeError):
+#     custom_commands = {}
+# -----------------------------------------------
+
 @app.on_event("startup")
 async def startup():
     print("Starting Telegram client...")
@@ -29,59 +41,103 @@ async def startup():
 
     @client.on(events.NewMessage)
     async def handle_message(event):
-        global is_offline, offline_message
+        global is_offline, offline_message, custom_commands # Add custom_commands to global
 
-        # Only allow owner to control commands
-        if event.sender_id == OWNER_ID:
-            cmd = event.raw_text.lower()
+        # Get sender information for common use
+        sender = await event.get_sender()
+        is_owner = event.sender_id == OWNER_ID
+        is_bot = isinstance(sender, User) and sender.bot
 
-            if cmd.startswith("/offline"):
+        # --- Command Handling for Owner ---
+        if is_owner:
+            cmd_text = event.raw_text.lower()
+
+            # Offline/Online commands
+            if cmd_text.startswith("/offline"):
                 parts = event.raw_text.split(" ", 1)
                 offline_message = parts[1] if len(parts) > 1 else "I'm currently offline."
                 is_offline = True
                 await event.reply(f"Offline mode enabled.\nMessage: {offline_message}")
-                return
-
-            elif cmd.startswith("/online"):
+                return # Don't process further commands
+            elif cmd_text.startswith("/online"):
                 is_offline = False
                 await event.reply("Online mode enabled. You're now online.")
-                return
+                return # Don't process further commands
 
-        # Handle auto-reply and message logging when offline
-        should_reply = event.is_private or event.mentioned
-        if is_offline and should_reply and event.sender_id != OWNER_ID:
-            sender = await event.get_sender()
+            # --- NEW: /set_command ---
+            if cmd_text.startswith("/set_command "):
+                # Expecting format: /set_command trigger | reply_message
+                parts = event.raw_text[len("/set_command "):].split("|", 1)
+                if len(parts) == 2:
+                    trigger = parts[0].strip()
+                    reply = parts[1].strip()
+                    if trigger: # Ensure trigger is not empty
+                        custom_commands[trigger.lower()] = reply # Store in lowercase for case-insensitivity
+                        await event.reply(f"Custom command set!\nTrigger: `{trigger}`\nReply: `{reply}`")
+                        # For persistence, save to file here:
+                        # with open("custom_commands.json", "w") as f:
+                        #     json.dump(custom_commands, f)
+                    else:
+                        await event.reply("Invalid format. Usage: `/set_command trigger | reply` (trigger cannot be empty)")
+                else:
+                    await event.reply("Invalid format. Usage: `/set_command trigger | reply`")
+                return # Don't process further commands
 
-            # --- THE CRITICAL MODIFICATION START ---
-            # Check if the sender is a User and specifically if that User is a Telegram bot
-            if isinstance(sender, User) and sender.bot:
-                print(f"DEBUG: Skipping reply to a Telegram bot. "
-                      f"Sender Name: {sender.first_name} (ID: {sender.id}), "
-                      f"Username: @{sender.username or 'N/A'}. "
-                      f"IsBot: {sender.bot}")
-                return # Crucially, exit the function to prevent reply
+            # --- NEW: /del_command ---
+            if cmd_text.startswith("/del_command "):
+                trigger_to_delete = event.raw_text[len("/del_command "):].strip().lower()
+                if trigger_to_delete in custom_commands:
+                    del custom_commands[trigger_to_delete]
+                    await event.reply(f"Custom command `{trigger_to_delete}` deleted.")
+                    # For persistence, save to file here:
+                    # with open("custom_commands.json", "w") as f:
+                    #     json.dump(custom_commands, f)
+                else:
+                    await event.reply(f"Custom command `{trigger_to_delete}` not found.")
+                return # Don't process further commands
 
-            # Optionally, you might want to skip replies to channels/groups too,
-            # though `event.is_private` should largely handle this for direct replies.
-            # If you want to explicitly avoid replying to channels/groups even if mentioned:
-            # if isinstance(sender, (Channel, Chat)):
-            #     print(f"DEBUG: Skipping reply to a channel/group: {sender.title} (ID: {sender.id})")
-            #     return
-            # --- THE CRITICAL MODIFICATION END ---
+            # --- NEW: /list_commands ---
+            if cmd_text == "/list_commands":
+                if custom_commands:
+                    response = "Current Custom Commands:\n"
+                    for trigger, reply in custom_commands.items():
+                        response += f"`{trigger}` -> `{reply}`\n"
+                else:
+                    response = "No custom commands set yet."
+                await event.reply(response)
+                return # Don't process further commands
 
-            # If it's not a bot (or if you removed the channel/group check), proceed to reply
+        # --- Auto-reply logic (for non-owner, and when online) ---
+        # Prioritize offline auto-reply if in offline mode
+        if is_offline and (event.is_private or event.mentioned) and not is_owner and not is_bot:
+            print(f"DEBUG: Replying with offline message to {sender.first_name} (ID: {sender.id})")
             await event.reply(offline_message)
-
-            # Get sender info for logging
+            # Log to Saved Messages
+            await event.forward_to("me")
             sender_name = sender.first_name or "Unknown"
             username = f"@{sender.username}" if sender.username else "No username"
-
-            # Send to Saved Messages
-            await event.forward_to("me")
             await client.send_message(
                 "me",
                 f"↖️ Message above was from {sender_name} ({username}) while you were offline."
             )
+            return # Crucially, return after handling offline message
+
+        # --- Handle custom commands when ONLINE and conditions met ---
+        # Only process custom commands if bot is ONLINE, sender is not owner, and not a bot
+        if not is_offline and not is_owner and not is_bot:
+            message_text = event.raw_text.lower()
+            
+            # Check for direct message or mention in group
+            is_relevant_chat = event.is_private or event.mentioned
+
+            if is_relevant_chat:
+                for trigger, reply in custom_commands.items():
+                    # Simple check: if trigger is in message text
+                    if trigger in message_text:
+                        print(f"DEBUG: Found custom command trigger '{trigger}'. Replying to {sender.first_name}.")
+                        await event.reply(reply)
+                        return # Reply once and stop
+        # -----------------------------------------------------------
 
     asyncio.create_task(client.run_until_disconnected())
 
@@ -102,3 +158,4 @@ async def go_online():
     global is_offline
     is_offline = False
     return {"status": "Online mode enabled"}
+
