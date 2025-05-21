@@ -1,106 +1,84 @@
-import json
-from fastapi import FastAPI
-from telethon import TelegramClient, events
 import os
 import asyncio
+from fastapi import FastAPI
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
-# ====== Config ======
+# Load environment variables
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("SESSION")  # Exported string session
-BOT_OWNER_ID = int(os.getenv("OWNER_ID"))  # Your user ID
+SESSION = os.getenv("SESSION")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
-# ====== JSON Handling ======
-DATA_FILE = "data.json"
-
-def load_data():
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-# ====== Userbot Setup ======
-from telethon.sessions import StringSession
-client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+# FastAPI instance
 app = FastAPI()
 
+# Telethon client
+client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+
+# Global state
+is_offline = False
+offline_message = "I'm currently offline. Will reply soon!"
+
+@app.on_event("startup")
+async def startup():
+    print("Starting Telegram client...")
+    await client.start()
+    print("Telegram client started.")
+
+    @client.on(events.NewMessage)
+    async def handle_message(event):
+        global is_offline, offline_message
+
+        # Only allow owner to control commands
+        if event.sender_id == OWNER_ID:
+            cmd = event.raw_text.lower()
+
+            if cmd.startswith("/offline"):
+                parts = event.raw_text.split(" ", 1)
+                offline_message = parts[1] if len(parts) > 1 else "I'm currently offline."
+                is_offline = True
+                await event.reply(f"Offline mode enabled.\nMessage: {offline_message}")
+                return
+
+            elif cmd.startswith("/online"):
+                is_offline = False
+                await event.reply("Online mode disabled. You're now online.")
+                return
+
+        # Handle auto-reply and message logging when offline
+        should_reply = event.is_private or event.mentioned or event.is_reply
+        if is_offline and should_reply and event.sender_id != OWNER_ID:
+            await event.reply(offline_message)
+
+            # Get sender info
+            sender = await event.get_sender()
+            sender_name = sender.first_name or "Unknown"
+            username = f"@{sender.username}" if sender.username else "No username"
+
+            # Send to Saved Messages
+            await event.forward_to("me")
+            await client.send_message(
+                "me",
+                f"↖️ Message above was from {sender_name} ({username}) while you were offline."
+            )
+
+    asyncio.create_task(client.run_until_disconnected())
+
+# FastAPI endpoints (for Render)
 @app.get("/")
-def root():
-    return {"status": "Userbot is alive!"}
+async def root():
+    return {"status": "Online", "offline_mode": is_offline}
 
-# ====== Bot Logic ======
-@client.on(events.NewMessage(from_users=BOT_OWNER_ID, pattern=r"/offline (.+)"))
-async def set_offline(event):
-    msg = event.pattern_match.group(1)
-    data = load_data()
-    data["offline"] = True
-    data["message"] = msg
-    save_data(data)
-    await event.reply("Offline mode activated.")
+@app.post("/offline")
+async def go_offline(data: dict):
+    global is_offline, offline_message
+    offline_message = data.get("message", "I'm currently offline.")
+    is_offline = True
+    return {"status": "Offline", "message": offline_message}
 
-@client.on(events.NewMessage(from_users=BOT_OWNER_ID, pattern=r"/online"))
-async def set_online(event):
-    data = load_data()
-    data["offline"] = False
-    save_data(data)
-    await event.reply("Back online!")
-
-@client.on(events.NewMessage(from_users=BOT_OWNER_ID, pattern=r"/getmentions"))
-async def send_logs(event):
-    data = load_data()
-    logs = data.get("logs", [])
-    if not logs:
-        await event.reply("No mentions or messages found.")
-    else:
-        text = "\n\n".join([f"From: {l['from']}\nText: {l['text']}" for l in logs[-10:]])
-        await event.reply(f"Last {len(logs[-10:])} logs:\n\n{text}")
-
-@client.on(events.NewMessage())
-async def auto_reply(event):
-    data = load_data()
-    if not data["offline"]:
-        return
-
-    # Avoid replying to yourself
-    if event.sender_id == BOT_OWNER_ID:
-        return
-
-    should_reply = False
-
-    # Check for DM
-    if event.is_private:
-        should_reply = True
-
-    # Check for reply to you
-    if event.is_reply:
-        reply_msg = await event.get_reply_message()
-        if reply_msg.sender_id == BOT_OWNER_ID:
-            should_reply = True
-
-    # Check for mention
-    if event.message.mentioned:
-        should_reply = True
-
-    if should_reply:
-        await event.reply(data["message"])
-        # Log it
-        data["logs"].append({
-            "from": str(event.sender_id),
-            "text": event.raw_text
-        })
-        save_data(data)
-
-# ====== Run Loop ======
-def start_bot():
-    loop = asyncio.get_event_loop()
-    loop.create_task(client.start())
-    loop.run_until_complete(client.connect())
-
-    if not client.is_connected():
-        loop.run_until_complete(client.connect())
-
-    loop.create_task(client.run_until_disconnected())
-
-start_bot()
+@app.post("/online")
+async def go_online():
+    global is_offline
+    is_offline = False
+    return {"status": "Online mode enabled"}
