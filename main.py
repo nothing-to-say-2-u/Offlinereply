@@ -3,6 +3,7 @@ import asyncio
 from fastapi import FastAPI
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
+from telethon.tl.types import User, Channel, Chat # Import necessary types for robust checks
 
 # Load environment variables
 API_ID = int(os.getenv("API_ID"))
@@ -50,15 +51,28 @@ async def startup():
         should_reply = event.is_private or event.mentioned
         if is_offline and should_reply and event.sender_id != OWNER_ID:
             sender = await event.get_sender()
-            # ADD THIS BLOCK START
-            if sender.bot:
-                print(f"Skipping reply to bot: {sender.first_name or 'Unknown'} ({sender.username or 'No username'})")
-                return # Exit the function if the sender is a bot
-            # ADD THIS BLOCK END
 
+            # --- THE CRITICAL MODIFICATION START ---
+            # Check if the sender is a User and specifically if that User is a Telegram bot
+            if isinstance(sender, User) and sender.bot:
+                print(f"DEBUG: Skipping reply to a Telegram bot. "
+                      f"Sender Name: {sender.first_name} (ID: {sender.id}), "
+                      f"Username: @{sender.username or 'N/A'}. "
+                      f"IsBot: {sender.bot}")
+                return # Crucially, exit the function to prevent reply
+
+            # Optionally, you might want to skip replies to channels/groups too,
+            # though `event.is_private` should largely handle this for direct replies.
+            # If you want to explicitly avoid replying to channels/groups even if mentioned:
+            # if isinstance(sender, (Channel, Chat)):
+            #     print(f"DEBUG: Skipping reply to a channel/group: {sender.title} (ID: {sender.id})")
+            #     return
+            # --- THE CRITICAL MODIFICATION END ---
+
+            # If it's not a bot (or if you removed the channel/group check), proceed to reply
             await event.reply(offline_message)
 
-            # Get sender info (already retrieved above)
+            # Get sender info for logging
             sender_name = sender.first_name or "Unknown"
             username = f"@{sender.username}" if sender.username else "No username"
 
@@ -67,8 +81,7 @@ async def startup():
             await client.send_message(
                 "me",
                 f"↖️ Message above was from {sender_name} ({username}) while you were offline."
-    )
-            
+            )
 
     asyncio.create_task(client.run_until_disconnected())
 
