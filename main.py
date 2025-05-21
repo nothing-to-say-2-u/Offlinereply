@@ -49,10 +49,16 @@ async def startup():
         # Handle auto-reply and message logging when offline
         should_reply = event.is_private or event.mentioned
         if is_offline and should_reply and event.sender_id != OWNER_ID:
+            sender = await event.get_sender()
+            # ADD THIS BLOCK START
+            if sender.bot:
+                print(f"Skipping reply to bot: {sender.first_name or 'Unknown'} ({sender.username or 'No username'})")
+                return # Exit the function if the sender is a bot
+            # ADD THIS BLOCK END
+
             await event.reply(offline_message)
 
-            # Get sender info
-            sender = await event.get_sender()
+            # Get sender info (already retrieved above)
             sender_name = sender.first_name or "Unknown"
             username = f"@{sender.username}" if sender.username else "No username"
 
@@ -61,7 +67,8 @@ async def startup():
             await client.send_message(
                 "me",
                 f"↖️ Message above was from {sender_name} ({username}) while you were offline."
-            )
+    )
+            
 
     asyncio.create_task(client.run_until_disconnected())
 
