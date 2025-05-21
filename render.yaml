@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-userbot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: API_ID
+        value: your_api_id
+      - key: API_HASH
+        value: your_api_hash
+      - key: SESSION
+        value: your_string_session
+      - key: OWNER_ID
+        value: your_telegram_user_id
