@@ -17,7 +17,7 @@ app = FastAPI()
 client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
 # Global state
-is_offline = False
+is_offline = True
 offline_message = "I'm currently offline. Will reply soon!"
 
 @app.on_event("startup")
@@ -43,11 +43,11 @@ async def startup():
 
             elif cmd.startswith("/online"):
                 is_offline = False
-                await event.reply("Online mode disabled. You're now online.")
+                await event.reply("Online mode enabled. You're now online.")
                 return
 
         # Handle auto-reply and message logging when offline
-        should_reply = event.is_private or event.mentioned or event.is_reply
+        should_reply = event.is_private or event.mentioned
         if is_offline and should_reply and event.sender_id != OWNER_ID:
             await event.reply(offline_message)
 
