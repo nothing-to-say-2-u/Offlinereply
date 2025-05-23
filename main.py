@@ -146,6 +146,12 @@ async def startup():
 async def root():
     return {"status": "Online", "offline_mode": is_offline}
 
+@app.head("/")
+async def head_root():
+    # This will return only the headers, with a 200 OK status
+    return {"status": "Online"} # Content here is ignored for HEAD, but FastAPI requires something.
+    
+
 @app.post("/offline")
 async def go_offline(data: dict):
     global is_offline, offline_message
