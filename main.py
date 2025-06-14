@@ -161,25 +161,30 @@ async def startup():
                 save_state()
                 return
             elif cmd_text_lower.startswith("/offline_for "):
-                parts = cmd_text_raw.split(" ", 2)
-                if len(parts) >= 3:
+                parts = cmd_text_raw.split(" ", 3) # Split into at most 4 parts: /offline_for, num, unit, message
+                if len(parts) >= 3: # Need at least "/offline_for", "num", "unit"
                     try:
                         duration_val = int(parts[1])
-                        unit = parts[2].split(" ", 1)[0].lower() # e.g., "hours", "h", "minutes", "m"
+                        unit_raw = parts[2].lower() # e.g., "h", "m", "d"
                         
                         time_delta = timedelta()
-                        if unit in ["minutes", "minute", "m"]:
+                        if unit_raw in ["minutes", "minute", "m"]:
                             time_delta = timedelta(minutes=duration_val)
-                        elif unit in ["hours", "hour", "h"]:
+                        elif unit_raw in ["hours", "hour", "h"]:
                             time_delta = timedelta(hours=duration_val)
-                        elif unit in ["days", "day", "d"]:
+                        elif unit_raw in ["days", "day", "d"]:
                             time_delta = timedelta(days=duration_val)
                         else:
                             await event.reply("Invalid time unit. Use: `m` (minutes), `h` (hours), `d` (days).")
                             return
 
+                        # Extract the message: it's the 4th part if it exists
+                        if len(parts) == 4:
+                            offline_message = parts[3].strip()
+                        else:
+                            offline_message = "I'm temporarily offline." # Default if no message provided
+
                         offline_until_timestamp = datetime.now() + time_delta
-                        offline_message = parts[2].split(" ", 1)[1] if len(parts[2].split(" ", 1)) > 1 else "I'm temporarily offline."
                         is_offline = True
                         await event.reply(f"Offline mode enabled until {offline_until_timestamp.strftime('%Y-%m-%d %H:%M:%S')}.\nMessage: {offline_message}")
                         save_state()
@@ -302,15 +307,15 @@ async def startup():
                 # Command must be a reply to the media message!
                 if event.is_reply:
                     replied_msg = await event.get_reply_message()
-                    if replied_msg and (replied_msg.photo or replied_msg.document):
-                        media_id = None
+                    if replied_msg and replied_msg.media: # Check if media exists
+                        media_file_id = None
                         if replied_msg.photo:
-                            media_id = replied_msg.photo.id
-                        elif replied_msg.document:
-                            media_id = replied_msg.document.id
+                            media_file_id = replied_msg.photo.file_id
+                        elif replied_msg.document: # Covers videos, files, stickers, GIFs
+                            media_file_id = replied_msg.document.file_id
                         
-                        if media_id is None:
-                            await event.reply("The replied message does not contain a photo or document.")
+                        if media_file_id is None:
+                            await event.reply("The replied message does not contain a usable photo or document media.")
                             return
 
                         parts = cmd_text_raw[len("/set_command_media "):].split("|", 1)
@@ -322,10 +327,10 @@ async def startup():
                                 key_trigger = trigger if is_case_sensitive_commands else trigger.lower()
                                 custom_commands[key_trigger] = {
                                     "type": "media",
-                                    "content": media_id,
+                                    "content": media_file_id, # Store file_id
                                     "caption": caption
                                 }
-                                await event.reply(f"Custom media command set!\nTrigger: `{trigger}`\nMedia ID: `{media_id}`\nCaption: `{caption}`")
+                                await event.reply(f"Custom media command set!\nTrigger: `{trigger}`\nMedia File ID: `{media_file_id}`\nCaption: `{caption}`")
                                 save_state()
                             else:
                                 await event.reply("Invalid format. Trigger cannot be empty. Usage: `/set_command_media trigger | [caption]` (reply to media)")
@@ -432,7 +437,9 @@ Owner Commands:
 - `/help_owner`: Show this help message.
 """
                 await event.reply(help_message)
-                return
+                return # Crucial: Return after owner command is handled
+
+        # --- END Owner Commands ---
 
         # --- Check Temporary Offline Mode expiration ---
         if is_offline and offline_until_timestamp and datetime.now() >= offline_until_timestamp:
@@ -482,8 +489,6 @@ Owner Commands:
             sorted_triggers = sorted(custom_commands.keys(), key=len, reverse=True)
             
             for trigger_key in sorted_triggers:
-                # Use raw_text for message_text_for_commands if case-sensitive, else lower()
-                
                 # Use word boundaries for more precise matching
                 # re.escape is used to handle special regex characters in the trigger itself
                 if re.search(r'\b' + re.escape(trigger_key) + r'\b', message_text_for_commands):
@@ -499,18 +504,18 @@ Owner Commands:
                         caption = command_details.get("caption", "")
                         print(f"DEBUG: Found custom media command trigger '{trigger_key}'. Replying with media to {sender.first_name}.")
                         try:
-                            # Use client.send_file to send by ID
+                            # Use client.send_file to send by file_id
                             await client.send_file(event.chat_id, content, caption=caption, reply_to=event.id)
                             return # Reply once and stop
                         except Exception as e:
                             print(f"Error sending media for command '{trigger_key}': {e}")
                             await event.reply(f"Sorry, I had an issue sending the media for that command ({e}). Please notify my owner.")
-                            # Don't return here if you want to fall through to other commands,
-                            # but usually, you'd want to stop after a specific command match.
-                            return
-            
-        # --- General Help Command (for anyone) ---
-        if cmd_text_lower == "/help" and not is_owner:
+                            return # Return here if the media command failed
+
+        # --- General Help Command (for non-owners) ---
+        # This block should be *outside* the `if is_owner:` block
+        # and should only process if the message hasn't been handled by other auto-replies/commands
+        if not is_owner and event.raw_text.lower() == "/help": # Use raw_text to specifically match /help
             help_message = """
 Hi! I'm an auto-reply bot.
 
@@ -520,7 +525,7 @@ If I'm online, I can respond to specific keywords:
 If I'm offline, I'll send an automatic reply.
 """
             await event.reply(help_message)
-            return
+            return # Return after handling public /help command
 
     # Keep client running in background
     asyncio.create_task(client.run_until_disconnected())
