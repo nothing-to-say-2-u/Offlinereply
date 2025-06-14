@@ -1,17 +1,50 @@
+# render.yaml
+
 services:
-  - type: web
-    name: telegram-userbot
-    env: python
-    region: oregon
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+  - type: web # Your bot runs as a web service due to FastAPI for health checks
+    name: telegram-auto-reply-bot # A unique name for your service
+    env: python # The language environment
+    plan: free # Or 'starter', 'standard', etc. for paid tiers
+    
+    # Branch to deploy from (e.g., main, master, dev)
+    # Ensure this matches the branch you push to GitHub
+    # buildFilter:
+    #   branches:
+    #     - main
+    
+    # Commands to run during the build process
+    buildCommand: |
+      pip install -r requirements.txt
+
+    # Command to start your application
+    # Assuming your main bot file is named 'main.py' and your FastAPI app instance is 'app'
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    # Environment variables (secrets should be set in Render dashboard, not here directly)
     envVars:
       - key: API_ID
-        value: your_api_id
+        value: "YOUR_TELEGRAM_API_ID" # REPLACE with your actual Telegram API ID (integer as string)
+        sync: false # Set to false if you manage value directly in Render dashboard
       - key: API_HASH
-        value: your_api_hash
+        value: "YOUR_TELEGRAM_API_HASH" # REPLACE with your actual Telegram API Hash
+        sync: false
       - key: SESSION
-        value: your_string_session
+        value: "YOUR_TELETHON_SESSION_STRING" # REPLACE with your generated Telethon session string
+        sync: false
       - key: OWNER_ID
-        value: your_telegram_user_id
+        value: "YOUR_TELEGRAM_OWNER_ID" # REPLACE with your actual Telegram Owner ID (integer as string)
+        sync: false
+      - key: TARGET_CHAT_ID
+        value: "YOUR_TARGET_CHAT_ID" # REPLACE with the chat ID for offline message forwarding (e.g., "-1001234567890" for a channel, or your user ID)
+        sync: false
+      - key: STORAGE_FILE
+        value: "bot_state.json" # Name of your persistence file. On free tier, this will be ephemeral.
+        sync: false
+
+    # Health check for Render to know your service is running
+    healthCheckPath: /
+
+    # If you later add a persistent disk (requires paid plan), uncomment and configure this:
+    # disks:
+    #   - name: bot-data
+    #     path: /var/data # This path inside the container must match where your code tries to save the file
