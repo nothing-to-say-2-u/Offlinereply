@@ -8,8 +8,8 @@ import re # For better keyword matching and regex escaping
 from fastapi import FastAPI
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.types import User, Channel, Chat, MessageMediaPhoto, MessageMediaDocument
-from telethon.errors import ChatIdInvalidError, PeerIdInvalidError, RPCError
+from telethon.tl.types import User, Channel, Chat, MessageMediaPhoto, MessageMediaDocument, InputPhoto, InputDocument
+from telethon.errors import ChatIdInvalidError, PeerIdInvalidError, RPCError, PhotoInvalidError, DocumentInvalidError
 
 # --- Environment Variables ---
 API_ID = int(os.getenv("API_ID"))
@@ -33,7 +33,7 @@ offline_until_timestamp = None # Stores datetime object for when offline mode en
 # Use sets for dnd_chats for efficient lookups and to avoid duplicates
 dnd_chats = set()
 specific_autoreplies = {} # {chat_id: "message"}
-custom_commands = {} # {"trigger": {"type": "text", "content": "reply_message"}} or {"type": "media", "content": "media_id", "caption": "optional_caption"}
+custom_commands = {} # {"trigger": {"type": "text", "content": "reply_message"}} or {"type": "media", "content": {"id": ..., "access_hash": ..., "file_reference": ...}, "caption": "optional_caption", "is_photo": True/False}
 is_case_sensitive_commands = False # Default to case-insensitive
 
 bot_start_time = datetime.now() # To track bot uptime
@@ -57,26 +57,98 @@ def load_state():
                 state = json.load(f)
                 dnd_chats = set(state.get("dnd_chats", []))
                 specific_autoreplies = state.get("specific_autoreplies", {})
-                custom_commands = state.get("custom_commands", {})
+                
+                # Custom loading for custom_commands to reconstruct InputPhoto/InputDocument
+                loaded_commands = state.get("custom_commands", {})
+                reconstructed_commands = {}
+                for trigger, details in loaded_commands.items():
+                    if details.get("type") == "media" and "content" in details:
+                        media_data = details["content"]
+                        if details.get("is_photo"):
+                            if all(k in media_data for k in ["id", "access_hash", "file_reference"]):
+                                try:
+                                    # Decode file_reference from base64 if it was encoded for JSON
+                                    file_reference_bytes = bytes.fromhex(media_data["file_reference"])
+                                    reconstructed_commands[trigger] = {
+                                        "type": "media",
+                                        "content": InputPhoto(
+                                            id=media_data["id"],
+                                            access_hash=media_data["access_hash"],
+                                            file_reference=file_reference_bytes # Ensure bytes
+                                        ),
+                                        "caption": details.get("caption", ""),
+                                        "is_photo": True
+                                    }
+                                except (TypeError, ValueError) as e:
+                                    print(f"Warning: Could not reconstruct InputPhoto for '{trigger}' due to bad file_reference: {e}")
+                                    # Fallback or skip if reconstruction fails
+                                    reconstructed_commands[trigger] = {"type": "text", "content": "Error: Media asset unavailable."}
+                            else:
+                                print(f"Warning: Missing photo components for '{trigger}'.")
+                                reconstructed_commands[trigger] = {"type": "text", "content": "Error: Media asset unavailable."}
+                        else: # Assume Document
+                            if all(k in media_data for k in ["id", "access_hash", "file_reference"]):
+                                try:
+                                    file_reference_bytes = bytes.fromhex(media_data["file_reference"])
+                                    reconstructed_commands[trigger] = {
+                                        "type": "media",
+                                        "content": InputDocument(
+                                            id=media_data["id"],
+                                            access_hash=media_data["access_hash"],
+                                            file_reference=file_reference_bytes # Ensure bytes
+                                        ),
+                                        "caption": details.get("caption", ""),
+                                        "is_photo": False
+                                    }
+                                except (TypeError, ValueError) as e:
+                                    print(f"Warning: Could not reconstruct InputDocument for '{trigger}' due to bad file_reference: {e}")
+                                    reconstructed_commands[trigger] = {"type": "text", "content": "Error: Media asset unavailable."}
+                            else:
+                                print(f"Warning: Missing document components for '{trigger}'.")
+                                reconstructed_commands[trigger] = {"type": "text", "content": "Error: Media asset unavailable."}
+                    else:
+                        reconstructed_commands[trigger] = details # Keep text commands as is
+                custom_commands = reconstructed_commands
+
                 is_case_sensitive_commands = state.get("is_case_sensitive_commands", False)
             print(f"Bot state loaded from {STORAGE_FILE}")
         else:
             print(f"No state file found at {STORAGE_FILE}. Starting fresh.")
     except (json.JSONDecodeError, FileNotFoundError) as e:
         print(f"Error loading state: {e}. Starting fresh.")
-    # Ensure all required keys exist even if file was empty or corrupted
     if not isinstance(dnd_chats, set): dnd_chats = set()
     if not isinstance(specific_autoreplies, dict): specific_autoreplies = {}
     if not isinstance(custom_commands, dict): custom_commands = {}
     if not isinstance(is_case_sensitive_commands, bool): is_case_sensitive_commands = False
 
+
 def save_state():
     state = {
-        "dnd_chats": list(dnd_chats), # Convert set to list for JSON serialization
+        "dnd_chats": list(dnd_chats),
         "specific_autoreplies": specific_autoreplies,
-        "custom_commands": custom_commands,
         "is_case_sensitive_commands": is_case_sensitive_commands,
     }
+
+    # Custom saving for custom_commands to handle InputPhoto/InputDocument
+    serializable_commands = {}
+    for trigger, details in custom_commands.items():
+        if details.get("type") == "media" and isinstance(details.get("content"), (InputPhoto, InputDocument)):
+            media_obj = details["content"]
+            # Convert bytes (file_reference) to hex string for JSON serialization
+            serializable_commands[trigger] = {
+                "type": "media",
+                "content": {
+                    "id": media_obj.id,
+                    "access_hash": media_obj.access_hash,
+                    "file_reference": media_obj.file_reference.hex() # Convert bytes to hex string
+                },
+                "caption": details.get("caption", ""),
+                "is_photo": isinstance(media_obj, InputPhoto)
+            }
+        else:
+            serializable_commands[trigger] = details
+    state["custom_commands"] = serializable_commands
+
     try:
         with open(STORAGE_FILE, "w") as f:
             json.dump(state, f, indent=4)
@@ -102,13 +174,7 @@ async def get_chat_entity_from_arg(arg, event):
         # Not an integer, try as a username
         try:
             entity = await client.get_entity(arg)
-            # Use the resolved entity's ID for consistency
             resolved_id = entity.id
-            if isinstance(entity, (Channel, Chat)) and entity.megagroup:
-                # For supergroups and channels, the ID might be negative in some contexts.
-                # Use event.chat_id for reliable target when sending replies/forwards within the handler context.
-                # However, for storage, entity.id is generally what you want.
-                pass
             return entity, resolved_id, None
         except (ValueError, ChatIdInvalidError, PeerIdInvalidError) as e:
             return None, None, f"Could not find chat/user for '{arg}': {e}"
@@ -124,7 +190,6 @@ async def startup():
     await client.start()
     print("Telegram client started.")
 
-    # Main message handler
     @client.on(events.NewMessage)
     async def handle_message(event):
         global is_offline, offline_message, offline_until_timestamp, \
@@ -134,17 +199,14 @@ async def startup():
         sender_id = event.sender_id
         is_owner = sender_id == OWNER_ID
         is_bot = isinstance(sender, User) and sender.bot
-        chat_id = event.chat_id # The ID of the chat where the message originated
+        chat_id = event.chat_id
 
-        # Convert message text based on case sensitivity setting
         message_text_for_commands = event.raw_text
         if not is_case_sensitive_commands:
             message_text_for_commands = message_text_for_commands.lower()
 
-        # --- DND Check (applies to all incoming messages for auto-reply/forward) ---
         if chat_id in dnd_chats:
-            # print(f"DEBUG: Message from DND chat {chat_id}. Ignoring auto-reply/forward.")
-            return # Do not process messages from DND chats for auto-reply/forward
+            return
 
         # --- Owner Commands ---
         if is_owner:
@@ -152,20 +214,40 @@ async def startup():
             cmd_text_lower = cmd_text_raw.lower()
 
             # --- Offline/Online commands ---
-            if cmd_text_lower.startswith("/offline"):
-                parts = cmd_text_raw.split(" ", 1)
-                offline_message = parts[1] if len(parts) > 1 else "I'm currently offline."
-                is_offline = True
-                offline_until_timestamp = None # Clear any timed offline
-                await event.reply(f"Offline mode enabled.\nMessage: {offline_message}")
-                save_state()
-                return
-            elif cmd_text_lower.startswith("/offline_for "):
-                parts = cmd_text_raw.split(" ", 3) # Split into at most 4 parts: /offline_for, num, unit, message
-                if len(parts) >= 3: # Need at least "/offline_for", "num", "unit"
+            # IMPORTANT: Check for /offline_for first (more specific)
+            if cmd_text_lower.startswith("/offline_for "):
+                clean_cmd_text = cmd_text_raw.strip()
+
+                first_space_idx = clean_cmd_text.find(" ")
+                second_space_idx = -1
+                if first_space_idx != -1:
+                    second_space_idx = clean_cmd_text.find(" ", first_space_idx + 1)
+                
+                third_space_idx = -1
+                if second_space_idx != -1:
+                    third_space_idx = clean_cmd_text.find(" ", second_space_idx + 1)
+
+                parts = []
+                offline_message_content = ""
+
+                if third_space_idx == -1: # No third space means no custom message after unit
+                    parts = clean_cmd_text.split(" ", 2) # Only command, num, unit
+                    if len(parts) < 3: # Not enough parts for even num and unit
+                        await event.reply("Invalid usage. Usage: `/offline_for <number> <unit> [message]`")
+                        return
+                    offline_message_content = "I'm temporarily offline."
+                else: # Third space found, meaning there's a custom message
+                    parts = clean_cmd_text.split(" ", 3) # Command, num, unit, message
+                    if len(parts) < 4: # Should not happen if third_space_idx is found, but for safety
+                         await event.reply("Error parsing command. Usage: `/offline_for <number> <unit> [message]`")
+                         return
+                    offline_message_content = parts[3].strip()
+
+
+                if len(parts) >= 3:
                     try:
                         duration_val = int(parts[1])
-                        unit_raw = parts[2].lower() # e.g., "h", "m", "d"
+                        unit_raw = parts[2].lower()
                         
                         time_delta = timedelta()
                         if unit_raw in ["minutes", "minute", "m"]:
@@ -178,24 +260,30 @@ async def startup():
                             await event.reply("Invalid time unit. Use: `m` (minutes), `h` (hours), `d` (days).")
                             return
 
-                        # Extract the message: it's the 4th part if it exists
-                        if len(parts) == 4:
-                            offline_message = parts[3].strip()
-                        else:
-                            offline_message = "I'm temporarily offline." # Default if no message provided
-
                         offline_until_timestamp = datetime.now() + time_delta
                         is_offline = True
-                        await event.reply(f"Offline mode enabled until {offline_until_timestamp.strftime('%Y-%m-%d %H:%M:%S')}.\nMessage: {offline_message}")
+                        await event.reply(f"Offline mode enabled until {offline_until_timestamp.strftime('%Y-%m-%d %H:%M:%S')}.\nMessage: {offline_message_content}")
                         save_state()
                         return
                     except ValueError:
                         await event.reply("Invalid duration format. Usage: `/offline_for <number> <unit> [message]`")
                         return
-                else:
+                else: # Fallback if initial parsing was really off, or if only "/offline_for" was sent
                     await event.reply("Invalid usage. Usage: `/offline_for <number> <unit> [message]`")
                 return
 
+            # THEN check for /offline (less specific)
+            elif cmd_text_lower.startswith("/offline"):
+                # Ensure it's exactly "/offline" or "/offline " to avoid matching "/offline_for" or similar
+                if cmd_text_lower == "/offline" or cmd_text_lower.startswith("/offline "):
+                    parts = cmd_text_raw.split(" ", 1) # Splits into ["/offline", "message"]
+                    offline_message = parts[1] if len(parts) > 1 else "I'm currently offline."
+                    is_offline = True
+                    offline_until_timestamp = None
+                    await event.reply(f"Offline mode enabled.\nMessage: {offline_message}")
+                    save_state()
+                    return
+            
             elif cmd_text_lower.startswith("/online"):
                 is_offline = False
                 offline_until_timestamp = None
@@ -250,7 +338,7 @@ async def startup():
                     message = parts[1].strip()
                     entity, resolved_id, error = await get_chat_entity_from_arg(arg, event)
                     if entity and message:
-                        specific_autoreplies[str(resolved_id)] = message # Store ID as string for JSON key safety
+                        specific_autoreplies[str(resolved_id)] = message
                         await event.reply(f"Specific auto-reply set for {entity.title if hasattr(entity, 'title') else entity.first_name} (ID: `{resolved_id}`):\n`{message}`")
                         save_state()
                     else:
@@ -276,7 +364,7 @@ async def startup():
                     response = "Specific Auto-replies:\n"
                     for chat_id_str, msg in specific_autoreplies.items():
                         try:
-                            entity = await client.get_entity(int(chat_id_str)) # Convert back to int for get_entity
+                            entity = await client.get_entity(int(chat_id_str))
                             name = entity.title if hasattr(entity, 'title') else entity.first_name
                             response += f"- `{name}` (ID: `{chat_id_str}`): `{msg}`\n"
                         except (ChatIdInvalidError, PeerIdInvalidError, RPCError):
@@ -288,7 +376,6 @@ async def startup():
 
             # --- Custom Command Management ---
             elif cmd_text_lower.startswith("/set_command "):
-                # Expecting format: /set_command trigger | reply_message
                 parts = cmd_text_raw[len("/set_command "):].split("|", 1)
                 if len(parts) == 2:
                     trigger = parts[0].strip()
@@ -303,39 +390,48 @@ async def startup():
                 else:
                     await event.reply("Invalid format. Usage: `/set_command trigger | reply`")
                 return
+
             elif cmd_text_lower.startswith("/set_command_media "):
-                # Command must be a reply to the media message!
                 if event.is_reply:
                     replied_msg = await event.get_reply_message()
-                    if replied_msg and replied_msg.media: # Check if media exists
-                        media_file_id = None
-                        if replied_msg.photo:
-                            media_file_id = replied_msg.photo.file_id
-                        elif replied_msg.document: # Covers videos, files, stickers, GIFs
-                            media_file_id = replied_msg.document.file_id
+                    if replied_msg and replied_msg.media:
+                        media_object = None
+                        is_photo_media = False
                         
-                        if media_file_id is None:
-                            await event.reply("The replied message does not contain a usable photo or document media.")
-                            return
+                        if isinstance(replied_msg.media, MessageMediaPhoto) and replied_msg.media.photo:
+                            media_object = replied_msg.media.photo
+                            is_photo_media = True
+                        elif isinstance(replied_msg.media, MessageMediaDocument) and replied_msg.media.document:
+                            media_object = replied_msg.media.document
+                            is_photo_media = False
+                        
+                        if media_object:
+                            parts = cmd_text_raw[len("/set_command_media "):].split("|", 1)
+                            if len(parts) >= 1:
+                                trigger = parts[0].strip()
+                                caption = parts[1].strip() if len(parts) == 2 else ""
 
-                        parts = cmd_text_raw[len("/set_command_media "):].split("|", 1)
-                        if len(parts) >= 1: # Caption is optional
-                            trigger = parts[0].strip()
-                            caption = parts[1].strip() if len(parts) == 2 else ""
-
-                            if trigger:
-                                key_trigger = trigger if is_case_sensitive_commands else trigger.lower()
-                                custom_commands[key_trigger] = {
-                                    "type": "media",
-                                    "content": media_file_id, # Store file_id
-                                    "caption": caption
-                                }
-                                await event.reply(f"Custom media command set!\nTrigger: `{trigger}`\nMedia File ID: `{media_file_id}`\nCaption: `{caption}`")
-                                save_state()
+                                if trigger:
+                                    key_trigger = trigger if is_case_sensitive_commands else trigger.lower()
+                                    
+                                    custom_commands[key_trigger] = {
+                                        "type": "media",
+                                        "content": {
+                                            "id": media_object.id,
+                                            "access_hash": media_object.access_hash,
+                                            "file_reference": media_object.file_reference.hex()
+                                        },
+                                        "caption": caption,
+                                        "is_photo": is_photo_media
+                                    }
+                                    await event.reply(f"Custom media command set!\nTrigger: `{trigger}`\nMedia Type: {'Photo' if is_photo_media else 'Document'}\nCaption: `{caption}`")
+                                    save_state()
+                                else:
+                                    await event.reply("Invalid format. Trigger cannot be empty. Usage: `/set_command_media trigger | [caption]` (reply to media)")
                             else:
-                                await event.reply("Invalid format. Trigger cannot be empty. Usage: `/set_command_media trigger | [caption]` (reply to media)")
+                                await event.reply("Invalid format. Usage: `/set_command_media trigger | [caption]` (reply to media)")
                         else:
-                            await event.reply("Invalid format. Usage: `/set_command_media trigger | [caption]` (reply to media)")
+                            await event.reply("The replied message does not contain a usable photo or document media.")
                     else:
                         await event.reply("You must reply to a photo or document message to use this command.")
                 else:
@@ -363,9 +459,9 @@ async def startup():
                             content = details.get("content", "N/A")
                             response += f"`{trigger}` -> `{content}` (Text)\n"
                         elif cmd_type == "media":
-                            media_id = details.get("content", "N/A")
+                            media_content_repr = "Media Object (reconstructable)" if isinstance(details.get("content"), (InputPhoto, InputDocument)) else "Media (broken/N/A)"
                             caption = details.get("caption", "")
-                            response += f"`{trigger}` -> Media ID: `{media_id}` (Caption: `{caption}`) (Media)\n"
+                            response += f"`{trigger}` -> {media_content_repr} (Caption: `{caption}`) (Media)\n"
                     await event.reply(response)
                 else:
                     await event.reply("No custom commands set yet.")
@@ -379,7 +475,6 @@ async def startup():
                 elif arg == "off":
                     is_case_sensitive_commands = False
                     await event.reply("Custom commands are now case-insensitive.")
-                    # Re-normalize existing command keys if switching to insensitive
                     new_commands = {}
                     for trigger, details in custom_commands.items():
                         new_commands[trigger.lower()] = details
@@ -437,7 +532,7 @@ Owner Commands:
 - `/help_owner`: Show this help message.
 """
                 await event.reply(help_message)
-                return # Crucial: Return after owner command is handled
+                return
 
         # --- END Owner Commands ---
 
@@ -446,30 +541,26 @@ Owner Commands:
             print("Timed offline mode expired. Switching to online.")
             is_offline = False
             offline_until_timestamp = None
-            # Optionally, notify owner
             try:
                 await client.send_message(OWNER_ID, "Timed offline mode has expired. I am now online.")
             except Exception as e:
                 print(f"Could not send online notification to owner: {e}")
-            save_state() # Save state after going online
+            save_state()
 
         # --- Auto-reply logic (for non-owner, and when online/offline conditions met) ---
         is_private_or_mentioned = event.is_private or event.mentioned
         
-        # Determine the auto-reply message based on priority: Specific > Global
         current_auto_reply_message = None
         if str(chat_id) in specific_autoreplies:
             current_auto_reply_message = specific_autoreplies[str(chat_id)]
-        elif is_offline: # Only use global offline_message if not using specific AND is in offline mode
+        elif is_offline:
             current_auto_reply_message = offline_message
 
-        # Prioritize offline auto-reply if in offline mode and relevant chat
         if is_offline and is_private_or_mentioned and not is_owner and not is_bot:
-            if current_auto_reply_message: # Ensure there's a message to send
+            if current_auto_reply_message:
                 print(f"DEBUG: Replying with offline message to {sender.first_name} (ID: {sender_id}) in chat {chat_id}")
                 await event.reply(current_auto_reply_message)
                 
-                # Log to TARGET_CHAT_ID (owner's saved messages or specific chat)
                 try:
                     await event.forward_to(TARGET_CHAT_ID)
                     sender_name = sender.first_name or "Unknown"
@@ -480,42 +571,39 @@ Owner Commands:
                     )
                 except Exception as e:
                     print(f"Error forwarding message or sending notification to TARGET_CHAT_ID {TARGET_CHAT_ID}: {e}")
-                return # Crucially, return after handling offline message
+                return
 
-        # --- Handle custom commands when ONLINE and conditions met ---
-        # Only process custom commands if bot is ONLINE, sender is not owner, not a bot, and relevant chat
+        # --- Custom Command execution ---
         if not is_offline and not is_owner and not is_bot and is_private_or_mentioned:
-            # Sort triggers by length (longest first) to ensure more specific phrases are matched before shorter ones
             sorted_triggers = sorted(custom_commands.keys(), key=len, reverse=True)
             
             for trigger_key in sorted_triggers:
-                # Use word boundaries for more precise matching
-                # re.escape is used to handle special regex characters in the trigger itself
                 if re.search(r'\b' + re.escape(trigger_key) + r'\b', message_text_for_commands):
                     command_details = custom_commands[trigger_key]
                     cmd_type = command_details.get("type", "text")
-                    content = command_details.get("content")
-                    
+                    content_to_send = command_details.get("content")
+
                     if cmd_type == "text":
                         print(f"DEBUG: Found custom text command trigger '{trigger_key}'. Replying to {sender.first_name}.")
-                        await event.reply(content)
-                        return # Reply once and stop
-                    elif cmd_type == "media" and content:
+                        await event.reply(content_to_send)
+                        return
+                    elif cmd_type == "media" and content_to_send:
                         caption = command_details.get("caption", "")
                         print(f"DEBUG: Found custom media command trigger '{trigger_key}'. Replying with media to {sender.first_name}.")
                         try:
-                            # Use client.send_file to send by file_id
-                            await client.send_file(event.chat_id, content, caption=caption, reply_to=event.id)
-                            return # Reply once and stop
+                            await client.send_file(event.chat_id, content_to_send, caption=caption, reply_to=event.id)
+                            return
+                        except (PhotoInvalidError, DocumentInvalidError, RPCError) as e:
+                            print(f"Error sending media for command '{trigger_key}' (ID/Hash/Ref invalid?): {e}")
+                            await event.reply(f"Sorry, I had an issue sending the media for that command ({e}). The media might be expired or invalid. Please notify my owner.")
+                            return
                         except Exception as e:
-                            print(f"Error sending media for command '{trigger_key}': {e}")
-                            await event.reply(f"Sorry, I had an issue sending the media for that command ({e}). Please notify my owner.")
-                            return # Return here if the media command failed
+                            print(f"General error sending media for command '{trigger_key}': {e}")
+                            await event.reply(f"Sorry, a general error occurred while sending the media for that command ({e}). Please notify my owner.")
+                            return
 
         # --- General Help Command (for non-owners) ---
-        # This block should be *outside* the `if is_owner:` block
-        # and should only process if the message hasn't been handled by other auto-replies/commands
-        if not is_owner and event.raw_text.lower() == "/help": # Use raw_text to specifically match /help
+        if not is_owner and event.raw_text.lower() == "/help":
             help_message = """
 Hi! I'm an auto-reply bot.
 
@@ -525,12 +613,11 @@ If I'm online, I can respond to specific keywords:
 If I'm offline, I'll send an automatic reply.
 """
             await event.reply(help_message)
-            return # Return after handling public /help command
+            return
 
-    # Keep client running in background
     asyncio.create_task(client.run_until_disconnected())
 
-# FastAPI endpoints (for Render) - remain mostly unchanged, interacting with global state
+# FastAPI endpoints (for Render) - remain mostly unchanged
 @app.get("/")
 async def root():
     status_msg = "Online" if not is_offline else "Offline"
@@ -540,7 +627,7 @@ async def root():
 
 @app.head("/")
 async def head_root():
-    return {"status": "Online"} # Content here is ignored for HEAD
+    return {"status": "Online"}
 
 @app.post("/offline")
 async def go_offline_api(data: dict):
